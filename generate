@@ -1,0 +1,145 @@
+#!/usr/bin/bash
+
+if [ -z "$NAMESPACE" ]; then
+    NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+fi
+if [ -z "$KUBEARGS" ]; then
+    KUBEARGS="--token $(cat /var/run/secrets/kubernetes.io/serviceaccount/token) --server https://kubernetes.default.svc --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --namespace=$NAMESPACE"
+fi
+SANS=()
+
+for i in "$@"
+do
+case $i in
+    --subject=*)
+        SUBJECT="${i#*=}"
+        shift
+        ;;
+    --ca-key=*)
+        CA_KEY="${i#*=}"
+        shift
+        ;;
+    --ca-cert=*)
+        CA_CERT="${i#*=}"
+        shift
+        ;;
+    --generate-cert=*)
+        CERT="${i#*=}"
+        shift
+        ;;
+    --generate-pkcs12-cert=*)
+        PKCS12_CERT="${i#*=}"
+        shift
+        ;;
+    --pkcs12-password=*)
+        PKCS12_PASSWORD="${i#*=}"
+        shift
+        ;;
+    --service=*)
+        SERVICE="${i#*=}"
+        SANS+=( $SERVICE $SERVICE.$NAMESPACE.svc $SERVICE.$NAMESPACE.svc.cluster.local )
+        shift
+        ;;
+    --route=*)
+        ROUTE="${i#*=}"
+        ROUTE_HOST=$(oc get route $ROUTE -o jsonpath='{.spec.host}')
+        SANS+=( $ROUTE_HOST )
+        shift
+        ;;
+    --generate-ca)
+        GENERATE_CA=YES
+        shift
+        ;;
+    *)
+        echo "skipped $i"
+        ;;
+esac
+done
+
+CADIR=/tmp/cadir
+
+if [ -z "$SUBJECT" ]; then
+   SUBJECT=${SANS[0]}
+fi
+
+function write_password {
+    if [ -n "$PKCS12_PASSWORD" ]; then
+        echo $PKCS12_PASSWORD > $1
+    else
+        echo $(< /dev/urandom tr -dc _A-Z-a-z-0-9 | head -c8) > $1
+    fi
+}
+
+function generate_ca {
+    # Create the private key and self-signed certificate for the CA:
+    mkdir -p $CADIR
+    openssl genrsa -out $CADIR/ca-key.pem 2048
+    openssl req -new -batch -key $CADIR/ca-key.pem -out $CADIR/ca-csr.pem -subj "/CN=certsec $CA_CERT"
+    openssl x509 -req -in $CADIR/ca-csr.pem -signkey $CADIR/ca-key.pem -out $CADIR/ca.crt
+    write_password $CADIR/password.p12
+    openssl pkcs12 -export -nokeys -in $CADIR/ca.crt -out $CADIR/ca.p12 --passout file:$CADIR/password.p12
+    if [ -n "$CA_CERT" ]; then
+        oc $KUBEARGS create secret generic $CA_CERT --from-file=ca.crt=$CADIR/ca.crt --from-file=ca.p12=$CADIR/ca.p12 --from-file=password.p12=$CADIR/password.p12
+    fi
+    if [ -n "$CA_KEY" ]; then
+        oc $KUBEARGS create secret generic $CA_KEY --from-file=ca-key.pem=$CADIR/ca-key.pem
+    fi
+}
+
+function generate_cert {
+    # Create a private key and certificate, signed by the CA for inter-router connections:
+    CERTDIR=/tmp/certdir/$1
+    mkdir -p $CERTDIR
+    cat << EOF > $CERTDIR/server-req.conf
+[req]
+default_bits       = 2048
+distinguished_name = dn
+req_extensions     = req_ext
+
+[dn]
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+EOF
+    for i in ${!SANS[@]}; do
+        echo "DNS.$(( $i+1 )) = ${SANS[$i]}" >>  $CERTDIR/server-req.conf
+    done
+    cat $CERTDIR/server-req.conf
+    openssl req -out $CERTDIR/server-csr.pem -batch -newkey rsa:2048 -nodes -subj "/CN=$SUBJECT" -keyout $CERTDIR/tls.key -config $CERTDIR/server-req.conf -extensions req_ext
+    openssl x509 -req -in $CERTDIR/server-csr.pem -CA $CADIR/ca.crt -CAkey $CADIR/ca-key.pem -out $CERTDIR/tls.crt -CAcreateserial -extfile $CERTDIR/server-req.conf -extensions req_ext
+}
+
+function generate_tls_secret {
+    generate_cert $1
+    oc $KUBEARGS create secret tls $1 --cert=$CERTDIR/tls.crt --key=$CERTDIR/tls.key
+}
+
+function generate_pkcs12_cert {
+    generate_cert $1
+    write_password $CERTDIR/password.p12
+    openssl pkcs12 -export -out $CERTDIR/cert.p12 -inkey $CERTDIR/tls.key -in $CERTDIR/tls.crt  --passout file:$CERTDIR/password.p12
+    oc $KUBEARGS create secret generic $1 --from-file=cert.p12=$CERTDIR/cert.p12 --from-file=password.p12=$CERTDIR/password.p12
+}
+
+if [ -n "$GENERATE_CA" ]; then
+    generate_ca
+else
+    if [ -z "$CA_KEY" ] || [ -z "$CA_CERT" ]; then
+        echo "ERROR: --ca-key and --ca-cert needed when --generate-ca not specified"
+        exit 1
+    else
+        #retrieve key and cert
+        mkdir -p $CADIR
+        oc $KUBEARGS extract secret/$CA_KEY --to $CADIR
+        oc $KUBEARGS extract secret/$CA_CERT --to $CADIR
+    fi
+fi
+
+if [ -n "$CERT" ]; then
+    generate_tls_secret $CERT
+fi
+if [ -n "$PKCS12_CERT" ]; then
+    generate_pkcs12_cert $PKCS12_CERT
+fi
